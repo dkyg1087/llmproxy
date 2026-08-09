@@ -1,0 +1,30 @@
+# Environment variables & secrets
+.env
+*.env
+
+# SQLite databases & logs
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+logs.txt
+*.log
+
+# Python virtual environment & bytecode
+.venv/
+venv/
+ENV/
+__pycache__/
+*.py[cod]
+
+# IDE & system artifacts
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# MISC
+
+DESIGN.md
+/scratch
+test_client.py

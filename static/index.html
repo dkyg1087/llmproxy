@@ -1,0 +1,414 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>LLMProxy - Admin Control Center</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <div class="app-shell">
+
+    <!-- Top Navigation Header -->
+    <header class="navbar">
+      <div class="brand">
+        <span class="brand-title">LLMProxy Control</span>
+        <span class="brand-version">v1.0</span>
+      </div>
+
+      <nav class="nav-tabs">
+        <button class="nav-tab active" onclick="switchTab('overview')" id="tab-btn-overview">Overview</button>
+        <button class="nav-tab" onclick="switchTab('models')" id="tab-btn-models">Model Catalog</button>
+        <button class="nav-tab" onclick="switchTab('keys')" id="tab-btn-keys">API Key Vault</button>
+        <button class="nav-tab" onclick="switchTab('analytics')" id="tab-btn-analytics">Analytics</button>
+      </nav>
+
+      <div class="navbar-right">
+        <div class="status-indicator status-online" id="systemStatusBadge">
+          <span class="status-dot"></span>
+          <span id="systemStatusText">Operational</span>
+        </div>
+        <button class="btn btn-neutral" onclick="fetchDashboardData()">Refresh</button>
+      </div>
+    </header>
+
+    <!-- Main Container -->
+    <main class="main-body">
+
+      <!-- TAB 1: OVERVIEW & METRICS -->
+      <section class="tab-content active" id="view-overview">
+        <div class="metrics-grid">
+          <div class="metric-box">
+            <span class="metric-label">Total Requests</span>
+            <div class="metric-value" id="metricTotalRequests">0</div>
+            <span class="metric-sub">Cumulative processed</span>
+          </div>
+
+          <div class="metric-box">
+            <span class="metric-label">Total Tokens</span>
+            <div class="metric-value" id="metricTotalTokens">0</div>
+            <span class="metric-sub">Input + Output sum</span>
+          </div>
+
+          <div class="metric-box">
+            <span class="metric-label">First Token Latency (TTFT)</span>
+            <div class="metric-value" id="metricAvgTtft">0 ms</div>
+            <span class="metric-sub">Rolling average latency</span>
+          </div>
+
+          <div class="metric-box">
+            <span class="metric-label">Active Cooldowns / Healthy</span>
+            <div class="metric-value" id="metricActiveCooldowns">0 / 0</div>
+            <span class="metric-sub">Quarantined / Ready routes</span>
+          </div>
+        </div>
+
+        <!-- Capacity Pools Meter Card -->
+        <div class="card">
+          <div class="card-header">
+            <div>
+              <h3>Quota Capacity Pools</h3>
+              <p class="card-subtitle">Daily limits (RPD/TPD) and sliding window limits (RPM/TPM) across active models</p>
+            </div>
+          </div>
+          <div class="card-body">
+            <div class="capacity-meters">
+              
+              <!-- Daily RPD Capacity -->
+              <div class="capacity-block">
+                <div class="capacity-header">
+                  <span class="capacity-title">Daily Request Quota (RPD)</span>
+                  <span class="capacity-stats" id="capacityRpdStats">0 / 0 RPD Used (100% Available)</span>
+                </div>
+                <div class="meter-track meter-large">
+                  <div class="meter-fill" id="capacityRpdBar" style="width: 0%;"></div>
+                </div>
+              </div>
+
+              <!-- Daily TPD Capacity -->
+              <div class="capacity-block" style="margin-top: 16px;">
+                <div class="capacity-header">
+                  <span class="capacity-title">Daily Token Quota (TPD)</span>
+                  <span class="capacity-stats" id="capacityTpdStats">0 / 0 TPD Used (100% Available)</span>
+                </div>
+                <div class="meter-track meter-large">
+                  <div class="meter-fill" id="capacityTpdBar" style="width: 0%;"></div>
+                </div>
+              </div>
+
+              <!-- Sliding 60s RPM/TPM Capacity -->
+              <div style="display: flex; gap: 16px; margin-top: 20px; flex-wrap: wrap;">
+                <div class="capacity-block" style="flex: 1; min-width: 250px;">
+                  <div class="capacity-header">
+                    <span class="capacity-title">60s Sliding RPM</span>
+                    <span class="capacity-stats" id="capacityRpmStats">0 / 0 RPM</span>
+                  </div>
+                  <div class="meter-track">
+                    <div class="meter-fill" id="capacityRpmBar" style="width: 0%;"></div>
+                  </div>
+                </div>
+
+                <div class="capacity-block" style="flex: 1; min-width: 250px;">
+                  <div class="capacity-header">
+                    <span class="capacity-title">60s Sliding TPM</span>
+                    <span class="capacity-stats" id="capacityTpmStats">0 / 0 TPM</span>
+                  </div>
+                  <div class="meter-track">
+                    <div class="meter-fill" id="capacityTpmBar" style="width: 0%;"></div>
+                  </div>
+                </div>
+              </div>
+
+            </div>
+          </div>
+        </div>
+
+        <!-- Triage Classifier & Strategy Control -->
+        <div class="card" style="margin-top: 24px;">
+          <div class="card-header">
+            <div>
+              <h3>Prompt Triage Classifier</h3>
+              <p class="card-subtitle">Select prompt complexity classification strategy and classifier model</p>
+            </div>
+            <button class="btn btn-primary" onclick="saveTriageSettings()">Save Triage Settings</button>
+          </div>
+          <div class="card-body">
+            <div style="display: flex; gap: 24px; flex-wrap: wrap;">
+              <div class="form-field" style="flex: 1; min-width: 250px;">
+                <label for="triageStrategy">Triage Strategy</label>
+                <select id="triageStrategy" onchange="toggleTriageModelSelect()">
+                  <option value="llm">LLM Classifier (Smart Difficulty Grading)</option>
+                  <option value="heuristic">Rule-Based Heuristic (0ms Instant Local Grading)</option>
+                </select>
+              </div>
+              <div class="form-field" id="triageModelField" style="flex: 1; min-width: 250px;">
+                <label for="triageModelSelect">Classifier Model</label>
+                <select id="triageModelSelect">
+                  <!-- Populated dynamically -->
+                </select>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- TAB 2: MODEL CATALOG -->
+      <section class="tab-content" id="view-models">
+        <div class="card">
+          <div class="card-header">
+            <div>
+              <h3>Model Catalog & Quota Monitor</h3>
+              <p class="card-subtitle">Manage capability scores, sliding window limits, and availability</p>
+            </div>
+            <button class="btn btn-primary" onclick="openAddModelModal()">+ Add New Model</button>
+          </div>
+          <div class="card-body p-0">
+            <div class="table-container">
+              <table class="data-table">
+                <thead>
+                  <tr>
+                    <th class="sortable-header" onclick="sortByField('display_name')">Model Name <span id="sort-icon-display_name" class="sort-icon"></span></th>
+                    <th class="sortable-header" onclick="sortByField('platform')">Platform <span id="sort-icon-platform" class="sort-icon"></span></th>
+                    <th>Quota Group</th>
+                    <th class="sortable-header" onclick="sortByField('base_score')">Base Score <span id="sort-icon-base_score" class="sort-icon">↓</span></th>
+                    <th>Requests (RPM / RPD)</th>
+                    <th>Tokens (TPM / TPD)</th>
+                    <th>Status</th>
+                    <th>Enabled</th>
+                    <th>Actions</th>
+                  </tr>
+                </thead>
+                <tbody id="modelsTableBody">
+                  <tr>
+                    <td colspan="9" class="table-empty">Loading catalog models...</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- TAB 3: API KEY VAULT -->
+      <section class="tab-content" id="view-keys">
+        <div class="card">
+          <div class="card-header">
+            <div>
+              <h3>API Key Vault & Credentials</h3>
+              <p class="card-subtitle">Configure encrypted credentials and base provider URLs</p>
+            </div>
+            <button class="btn btn-primary" onclick="openKeyModal()">Add Provider Key</button>
+          </div>
+          <div class="card-body p-0">
+            <div class="table-container">
+              <table class="data-table">
+                <thead>
+                  <tr>
+                    <th>Platform</th>
+                    <th>Display Name</th>
+                    <th>Base Endpoint URL</th>
+                    <th>Status</th>
+                    <th>Enabled</th>
+                    <th>Last Used</th>
+                    <th>Actions</th>
+                  </tr>
+                </thead>
+                <tbody id="keysTableBody">
+                  <tr>
+                    <td colspan="7" class="table-empty">Loading provider keys...</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- TAB 4: ANALYTICS & TIME-SERIES -->
+      <section class="tab-content" id="view-analytics">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; flex-wrap: wrap; gap: 12px;">
+          <div>
+            <h3 style="font-size: 18px; font-weight: 600;">Analytics & Usage Insights</h3>
+            <p style="font-size: 13px; color: var(--text-muted); margin-top: 2px;">Historic traffic metrics, token distribution, and model performance</p>
+          </div>
+          <div style="display: flex; gap: 6px;">
+            <button class="btn btn-neutral btn-sm" onclick="changeAnalyticsTimeframe('today')" id="tf-today">Today</button>
+            <button class="btn btn-primary btn-sm" onclick="changeAnalyticsTimeframe('7d')" id="tf-7d">7 Days</button>
+            <button class="btn btn-neutral btn-sm" onclick="changeAnalyticsTimeframe('30d')" id="tf-30d">30 Days</button>
+            <button class="btn btn-neutral btn-sm" onclick="changeAnalyticsTimeframe('all')" id="tf-all">All Time</button>
+          </div>
+        </div>
+
+        <div class="metrics-grid" style="margin-bottom: 24px;">
+          <div class="metric-card">
+            <div class="metric-title">Total Requests</div>
+            <div class="metric-value" id="analyticsTotalReqs">0</div>
+            <div class="metric-subtitle" id="analyticsSuccessRate">100% Success Rate</div>
+          </div>
+
+          <div class="metric-card">
+            <div class="metric-title">Total Tokens Used</div>
+            <div class="metric-value" id="analyticsTotalTokens">0</div>
+            <div class="metric-subtitle" id="analyticsTokenSplit">0 In / 0 Out</div>
+          </div>
+
+          <div class="metric-card">
+            <div class="metric-title">Average Latency</div>
+            <div class="metric-value" id="analyticsAvgLatency">0 ms</div>
+            <div class="metric-subtitle" id="analyticsAvgTtft">TTFT: 0 ms</div>
+          </div>
+
+          <div class="metric-card">
+            <div class="metric-title">Routing Health</div>
+            <div class="metric-value" id="analyticsFailedReqs">0</div>
+            <div class="metric-subtitle">Failed / Quarantined Requests</div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-header">
+            <div>
+              <h3>Model Volume & Traffic Distribution</h3>
+              <p class="card-subtitle">Aggregated request counts, token consumption, and success rates per model</p>
+            </div>
+          </div>
+          <div class="card-body p-0">
+            <div class="table-container">
+              <table class="data-table">
+                <thead>
+                  <tr>
+                    <th>Model</th>
+                    <th>Platform</th>
+                    <th>Requests</th>
+                    <th>Total Tokens</th>
+                    <th>Avg Latency</th>
+                    <th>Success Rate</th>
+                  </tr>
+                </thead>
+                <tbody id="analyticsTableBody">
+                  <tr>
+                    <td colspan="6" class="table-empty">Loading analytics metrics...</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </section>
+
+    </main>
+
+    <!-- Modal: Add Provider Key -->
+    <div class="modal-overlay" id="keyModal" style="display: none;">
+      <div class="modal-dialog">
+        <div class="modal-header">
+          <h3 id="keyModalTitle">Add Provider Key</h3>
+          <button class="modal-close" onclick="closeKeyModal()">✕</button>
+        </div>
+        <form id="addKeyForm" onsubmit="saveApiKey(event)">
+          <div class="modal-body">
+            <div class="form-field">
+              <label for="keyPlatform">Platform Identifier</label>
+              <input type="text" id="keyPlatform" placeholder="google / groq / anthropic" required>
+            </div>
+            <div class="form-field">
+              <label for="keyDisplayName">Display Name</label>
+              <input type="text" id="keyDisplayName" placeholder="e.g. Google AI Studio Key" required>
+            </div>
+            <div class="form-field">
+              <label for="keyApiUrl">Base Endpoint URL</label>
+              <input type="url" id="keyApiUrl" placeholder="https://generativelanguage.googleapis.com/v1beta" required>
+            </div>
+            <div class="form-field">
+              <label for="keySecret">API Key Secret</label>
+              <input type="password" id="keySecret" placeholder="Leave blank to keep existing key secret">
+            </div>
+          </div>
+          <div class="modal-footer">
+            <button type="button" class="btn btn-neutral" onclick="closeKeyModal()">Cancel</button>
+            <button type="submit" class="btn btn-primary">Save Credential</button>
+          </div>
+        </form>
+      </div>
+    </div>
+
+    <!-- Modal: Add / Edit Model -->
+    <div class="modal-overlay" id="modelModal" style="display: none;">
+      <div class="modal-dialog">
+        <div class="modal-header">
+          <h3 id="modelModalTitle">Edit Model Parameters</h3>
+          <button class="modal-close" onclick="closeModelModal()">✕</button>
+        </div>
+        <form id="editModelForm" onsubmit="saveModelParameters(event)">
+          <input type="hidden" id="editModelMode" value="edit">
+          <input type="hidden" id="editOldPlatform">
+          <input type="hidden" id="editOldModelId">
+
+          <div class="modal-body">
+            <div class="form-field" id="fieldPlatformSelectGroup">
+              <label for="editModelPlatformSelect">Registered Provider Key</label>
+              <select id="editModelPlatformSelect" required>
+                <!-- Populated dynamically -->
+              </select>
+            </div>
+
+            <div class="form-field">
+              <label for="editModelId">Model Identifier (ID)</label>
+              <input type="text" id="editModelId" placeholder="e.g. gemini-3.1-flash-lite" required>
+            </div>
+
+            <div class="form-field">
+              <label for="editDisplayName">Model Display Name</label>
+              <input type="text" id="editDisplayName" placeholder="e.g. Gemini 3.1 Flash Lite" required>
+            </div>
+
+            <div class="form-field">
+              <label for="editSharedGroup">Shared Quota Group</label>
+              <input type="text" id="editSharedGroup" placeholder="e.g. groq_free or leave blank for per-model pool">
+            </div>
+
+            <div class="form-field">
+              <label for="editBaseScore">Base Utility Score (0 - 5)</label>
+              <input type="number" id="editBaseScore" min="0" max="5" value="3" required>
+            </div>
+
+            <div class="form-row" style="display: flex; gap: 12px;">
+              <div class="form-field" style="flex: 1;">
+                <label for="editRpmLimit">RPM Limit (Req/min)</label>
+                <input type="number" id="editRpmLimit" placeholder="RPM limit">
+              </div>
+              <div class="form-field" style="flex: 1;">
+                <label for="editRpdLimit">RPD Limit (Req/day)</label>
+                <input type="number" id="editRpdLimit" placeholder="RPD limit">
+              </div>
+            </div>
+
+            <div class="form-row" style="display: flex; gap: 12px;">
+              <div class="form-field" style="flex: 1;">
+                <label for="editTpmLimit">TPM Limit (Tok/min)</label>
+                <input type="number" id="editTpmLimit" placeholder="TPM limit">
+              </div>
+              <div class="form-field" style="flex: 1;">
+                <label for="editTpdLimit">TPD Limit (Tok/day)</label>
+                <input type="number" id="editTpdLimit" placeholder="TPD limit">
+              </div>
+            </div>
+          </div>
+          <div class="modal-footer">
+            <button type="button" class="btn btn-neutral" onclick="closeModelModal()">Cancel</button>
+            <button type="submit" class="btn btn-primary">Save Model</button>
+          </div>
+        </form>
+      </div>
+    </div>
+
+    <!-- Toast Notification Container -->
+    <div id="toastContainer" class="toast-container"></div>
+  </div>
+
+  <script src="/static/dashboard.js"></script>
+</body>
+</html>
