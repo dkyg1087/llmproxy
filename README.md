@@ -9,7 +9,7 @@ Includes an Admin Control Center dashboard for model catalog configuration, API 
 ## Disclaimer & Acknowledgements
 
 - **Disclaimer**: This is a personal practice project built for learning and experimentation. Users are responsible for reviewing and complying with the Terms of Service (TOS) and regulations of all third-party API providers they use with this gateway.
-- **Acknowledgements**: Please check out [freeLLMapi](https://github.com/freeLLMapi/freeLLMapi](https://github.com/tashfeenahmed/freellmapi), as this project is heavily influenced by their work.
+- **Acknowledgements**: Please check out [freeLLMapi](https://github.com/tashfeenahmed/freellmapi), as this project is heavily influenced by their work.
 
 ---
 
