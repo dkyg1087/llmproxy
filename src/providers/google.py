@@ -150,16 +150,20 @@ class GoogleAdapter(BaseProvider):
                 if tool_call_id:
                     tool_name = m.get("name") or _tool_name_by_call_id.get(tool_call_id) or "tool"
                     response_obj = _safe_parse_args(m.get("content"))
-                    contents.append({
-                        "role": "user",
-                        "parts": [{
-                            "functionResponse": {
-                                "id": tool_call_id,
-                                "name": tool_name,
-                                "response": response_obj
-                            }
-                        }]
-                    })
+                    func_part = {
+                        "functionResponse": {
+                            "id": tool_call_id,
+                            "name": tool_name,
+                            "response": response_obj
+                        }
+                    }
+                    if contents and contents[-1].get("role") == "user" and any("functionResponse" in p for p in contents[-1].get("parts", [])):
+                        contents[-1]["parts"].append(func_part)
+                    else:
+                        contents.append({
+                            "role": "user",
+                            "parts": [func_part]
+                        })
 
         outbound_body: Dict[str, Any] = {"contents": contents}
 
@@ -187,7 +191,10 @@ class GoogleAdapter(BaseProvider):
         if "top_p" in payload:
             gen_config["topP"] = payload["top_p"]
         if "max_tokens" in payload:
-            gen_config["maxOutputTokens"] = payload["max_tokens"]
+            try:
+                gen_config["maxOutputTokens"] = int(payload["max_tokens"])
+            except (ValueError, TypeError):
+                pass
         if gen_config:
             outbound_body["generationConfig"] = gen_config
 
@@ -213,7 +220,7 @@ class GoogleAdapter(BaseProvider):
             if part.get("thoughtSignature"):
                 last_sig = part["thoughtSignature"]
 
-            if part.get("text") and not part.get("thought"):
+            if part.get("text"):
                 text_parts.append(part["text"])
 
             fn_call = part.get("functionCall")
@@ -317,7 +324,7 @@ class GoogleAdapter(BaseProvider):
                     if part.get("thoughtSignature"):
                         self._last_stream_sig = part["thoughtSignature"]
 
-                    if part.get("text") and not part.get("thought"):
+                    if part.get("text"):
                         text_parts.append(part["text"])
 
                     fn_call = part.get("functionCall")

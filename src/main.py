@@ -1,5 +1,6 @@
 import time
 import os
+import json
 from typing import Dict, Any, List, Optional
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
@@ -578,3 +579,16 @@ async def get_admin_analytics(timeframe: str = "7d"):
             "avg_ttft_ms": avg_ttft,
             "models_breakdown": models_breakdown
         }
+
+
+@app.get("/api/debug/trace")
+async def get_latest_debug_trace():
+    """Returns the JSON trace of the last proxy request for debugging payload transformations."""
+    scratch_trace = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scratch", "latest_debug_trace.json")
+    if os.path.exists(scratch_trace):
+        try:
+            with open(scratch_trace, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            return JSONResponse(status_code=500, content={"error": f"Failed to read trace file: {e}"})
+    return JSONResponse(status_code=404, content={"message": "No debug trace available yet. Send a request to generate a trace."})

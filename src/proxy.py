@@ -1,3 +1,4 @@
+import os
 import time
 import json
 import httpx
@@ -5,7 +6,7 @@ import aiosqlite
 from typing import Optional, Dict, Any, AsyncGenerator
 from fastapi.responses import StreamingResponse, JSONResponse
 
-from src.config import logger, MAX_FAILOVER_RETRIES, CLIENT_TIMEOUT
+from src.config import logger, MAX_FAILOVER_RETRIES, CLIENT_TIMEOUT, DEBUG_PAYLOADS
 from src.models import ChatCompletionRequest
 from src.db import (
     get_db_connection,
@@ -18,6 +19,19 @@ from src.db import (
 )
 from src.router import select_model_and_platform
 from src.providers.registry import get_provider
+
+
+def save_debug_trace(trace_data: Dict[str, Any]):
+    """Saves the last request/response debug trace payload to scratch/latest_debug_trace.json."""
+    try:
+        scratch_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scratch")
+        os.makedirs(scratch_dir, exist_ok=True)
+        trace_path = os.path.join(scratch_dir, "latest_debug_trace.json")
+        with open(trace_path, "w", encoding="utf-8") as f:
+            json.dump(trace_data, f, indent=2, ensure_ascii=False)
+        logger.info(f"[DEBUG TRACE] Saved request trace to {trace_path}")
+    except Exception as e:
+        logger.error(f"[DEBUG TRACE ERROR] Failed to write trace: {e}")
 
 
 
@@ -153,6 +167,21 @@ async def execute_proxy_request(
             target_url, headers, outbound_body = adapter.build_request(
                 creds["api_url"], creds["api_key"], model_id, payload_dict
             )
+
+            # Debug Tracing
+            masked_headers = dict(headers)
+            if "Authorization" in masked_headers:
+                masked_headers["Authorization"] = "Bearer [MASKED_KEY]"
+            save_debug_trace({
+                "timestamp": time.time(),
+                "attempt": attempt,
+                "model_requested": payload.model,
+                "selected_route": {"platform": platform, "model_id": model_id},
+                "inbound_payload": payload_dict,
+                "target_url": target_url,
+                "headers": masked_headers,
+                "outbound_body": outbound_body
+            })
 
             start_time = time.perf_counter()
             is_streaming = payload_dict.get("stream") is True or "streamGenerateContent" in target_url

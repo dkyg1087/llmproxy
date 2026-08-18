@@ -38,3 +38,6 @@ CLIENT_TIMEOUT: httpx.Timeout = httpx.Timeout(10.0, read=60.0)
 # Triage LLM Classifier Timeout (Default 10s)
 TRIAGE_TIMEOUT_SECONDS: float = float(os.getenv("TRIAGE_TIMEOUT_SECONDS", "10.0"))
 TRIAGE_CLIENT_TIMEOUT: httpx.Timeout = httpx.Timeout(5.0, read=TRIAGE_TIMEOUT_SECONDS)
+
+# Debug Stage & Tracing
+DEBUG_PAYLOADS: bool = os.getenv("DEBUG_PAYLOADS", "false").lower() in ("true", "1", "yes")

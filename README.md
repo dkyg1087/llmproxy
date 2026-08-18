@@ -1,5 +1,7 @@
 # LLMProxy
 
+> **Notice**: Active development is currently underway to resolve multi-tool call payload handling across provider adapters.
+
 An OpenAI-compatible LLM router and failover proxy. It routes prompt requests across platforms (such as Google Gemini, Groq, and custom OpenAI-compatible providers) using Bandits with Knapsacks (BwK) optimization and automatic failover when rate limits occur.
 
 Includes an Admin Control Center dashboard for model catalog configuration, API key management, rate limit tracking, and system statistics.
