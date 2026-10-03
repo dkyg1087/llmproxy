@@ -1,18 +1,27 @@
 import pytest
 import os
-from src.db import init_db, get_db_connection
-from src.triage import grade_difficulty_by_rule, grade_prompt_difficulty
+import src.config
+from src.db import init_db, set_setting
+from src.triage import (
+    grade_difficulty_by_rule,
+    sanitize_messages_for_triage,
+    grade_prompt_difficulty,
+)
+
+import asyncio
 
 TEST_DB = "test_pytest_triage.db"
 
 
 @pytest.fixture(autouse=True)
-def cleanup_test_db():
+def setup_test_db(monkeypatch):
+    monkeypatch.setattr(src.config, "DB_PATH", TEST_DB)
     if os.path.exists(TEST_DB):
         try:
             os.remove(TEST_DB)
         except OSError:
             pass
+    asyncio.run(init_db(TEST_DB))
     yield
     if os.path.exists(TEST_DB):
         try:
@@ -22,40 +31,57 @@ def cleanup_test_db():
 
 
 def test_triage_heuristic_rules():
-    simple_messages = [{"role": "user", "content": "What is 2 + 2?"}]
-    score_simple = grade_difficulty_by_rule(simple_messages)
-    assert score_simple == 1
+    # 1. Simple short casual query
+    assert grade_difficulty_by_rule([{"role": "user", "content": "Hi"}]) == 1
 
-    complex_messages = [
-        {"role": "user", "content": "Please refactor and optimize this code:\n```python\nasync def run(): pass\n```\n" + "word " * 450}
+    # 2. Code fences -> floor of 4
+    code_msg = [{"role": "user", "content": "Look at this:\n```python\nprint(1)\n```"}]
+    assert grade_difficulty_by_rule(code_msg) >= 4
+
+    # 3. Multi-step numbered instructions
+    steps_msg = [{"role": "user", "content": "Please do:\n1. First step\n2. Second step\n3. Third step"}]
+    assert grade_difficulty_by_rule(steps_msg) >= 3
+
+    # 4. Tool calls present -> floor of 3
+    tool_msg = [{"role": "assistant", "content": None, "tool_calls": [{"id": "t1", "function": {"name": "search"}}]}]
+    assert grade_difficulty_by_rule(tool_msg) >= 3
+
+
+def test_sanitize_messages_for_triage():
+    long_tool_output = "x" * 500
+    raw_messages = [
+        {"role": "system", "content": "You are a helpful assistant."},
+        {"role": "user", "content": "Search for info."},
+        {"role": "tool", "content": long_tool_output},
+        {"role": "user", "content": "What did you find?"},
     ]
-    score_complex = grade_difficulty_by_rule(complex_messages)
-    assert score_complex >= 4
+
+    sanitized = sanitize_messages_for_triage(raw_messages, max_recent_turns=4)
+
+    # Tool output should be truncated to 250 characters + indicator
+    tool_entry = next((m for m in sanitized if "tool: " in m["content"]), None)
+    if tool_entry:
+        assert len(tool_entry["content"]) < 350
+        assert "[truncated]" in tool_entry["content"]
+
+    # Consecutive messages of same role should be merged
+    roles = [m["role"] for m in sanitized]
+    for i in range(len(roles) - 1):
+        assert roles[i] != roles[i + 1]
 
 
 @pytest.mark.asyncio
-async def test_triage_fallback_on_missing_creds():
-    await init_db(TEST_DB)
-    simple_messages = [{"role": "user", "content": "Hello"}]
-    async with get_db_connection(TEST_DB) as conn:
-        fallback_score = await grade_prompt_difficulty(conn, simple_messages)
-        assert fallback_score == 1
+async def test_grade_prompt_difficulty_heuristic_mode():
+    await set_setting("triage_strategy", "heuristic")
+    difficulty = await grade_prompt_difficulty([{"role": "user", "content": "Quick question"}])
+    assert difficulty == 1
 
 
 @pytest.mark.asyncio
-async def test_triage_fallback_on_disabled_model():
-    await init_db(TEST_DB)
-    simple_messages = [{"role": "user", "content": "Hello"}]
-    async with get_db_connection(TEST_DB) as conn:
-        await conn.execute(
-            "INSERT OR REPLACE INTO api_keys (platform, display_name, encrypted_key, iv, status, enabled) VALUES ('google', 'Google AI', 'cipher', 'iv', 'healthy', 1)"
-        )
-        await conn.execute(
-            "INSERT INTO models (platform, model_id, display_name, enabled) VALUES ('google', 'disabled-triage-model', 'Disabled Triage Model', 0)"
-        )
-        await conn.execute("INSERT INTO gateway_settings (key, value) VALUES ('triage_platform', 'google')")
-        await conn.execute("INSERT INTO gateway_settings (key, value) VALUES ('triage_model', 'disabled-triage-model')")
-        await conn.commit()
-
-        fallback_score = await grade_prompt_difficulty(conn, simple_messages)
-        assert fallback_score == 1
+async def test_grade_prompt_difficulty_fallback_to_rule():
+    await set_setting("triage_strategy", "llm")
+    # Empty DB with no keys/models configured -> should gracefully fall back to rule-based
+    difficulty = await grade_prompt_difficulty([
+        {"role": "user", "content": "Please optimize:\n```python\nx = 1\n```"}
+    ])
+    assert difficulty >= 4

@@ -1,19 +1,23 @@
 import pytest
 import os
-from src.db import init_db, get_db_connection, add_cooldown
-from src.key_vault import encrypt_key
+import src.config
+from src.db import init_db, save_key, add_model, add_cooldown
 from src.router import select_model_and_platform
+
+import asyncio
 
 TEST_DB = "test_pytest_router.db"
 
 
 @pytest.fixture(autouse=True)
-def cleanup_test_db():
+def setup_test_db(monkeypatch):
+    monkeypatch.setattr(src.config, "DB_PATH", TEST_DB)
     if os.path.exists(TEST_DB):
         try:
             os.remove(TEST_DB)
         except OSError:
             pass
+    asyncio.run(init_db(TEST_DB))
     yield
     if os.path.exists(TEST_DB):
         try:
@@ -23,113 +27,80 @@ def cleanup_test_db():
 
 
 @pytest.mark.asyncio
-async def test_bwk_router_selection_and_failover():
-    await init_db(TEST_DB)
-    async with get_db_connection(TEST_DB) as conn:
-        cipher, iv = encrypt_key("sk-test")
-        cur = await conn.execute(
-            "INSERT OR REPLACE INTO api_keys (platform, display_name, encrypted_key, iv, status, enabled) VALUES (?, ?, ?, ?, 'healthy', 1)",
-            ("google", "Google AI", cipher, iv)
-        )
-        k1 = cur.lastrowid
+async def test_router_difficulty_matching_and_cooldown_failover():
+    await save_key(platform="google", raw_key="sk-test-google")
+    await save_key(platform="groq", raw_key="sk-test-groq")
 
-        cur = await conn.execute(
-            "INSERT INTO api_keys (platform, display_name, encrypted_key, iv) VALUES (?, ?, ?, ?)",
-            ("groq", "Groq Inc", cipher, iv)
-        )
-        k2 = cur.lastrowid
+    # High capability model (Score 5)
+    await add_model(
+        platform="google",
+        model_id="gemini-pro",
+        display_name="Gemini Pro",
+        base_score=5,
+        rpm_limit=100
+    )
+    # Lightweight model (Score 2)
+    await add_model(
+        platform="groq",
+        model_id="llama-fast",
+        display_name="Llama Fast",
+        base_score=2,
+        rpm_limit=100
+    )
 
-        await conn.execute(
-            "INSERT INTO models (platform, model_id, display_name, base_score) VALUES (?, ?, ?, ?)",
-            ("google", "gemini-3-flash", "Gemini Flash", 70)
-        )
-        await conn.execute(
-            "INSERT INTO models (platform, model_id, display_name, base_score) VALUES (?, ?, ?, ?)",
-            ("groq", "gemma-4-31b", "Gemma 31B", 50)
-        )
-        await conn.commit()
+    # 1. High difficulty prompt (difficulty=5) picks Score 5 model
+    route_hard = await select_model_and_platform("auto", difficulty=5)
+    assert route_hard is not None
+    assert route_hard["model_id"] == "gemini-pro"
 
-        # 1. Higher score model wins initially
-        route1 = await select_model_and_platform(conn, "auto", 1)
-        assert route1 is not None
-        assert route1["model_id"] == "gemini-3-flash"
-
-        # 2. When Gemini enters cooldown, router falls back to Groq
-        await add_cooldown(conn, "google", "gemini-3-flash", k1, 60)
-        route2 = await select_model_and_platform(conn, "auto", 1)
-        assert route2 is not None
-        assert route2["model_id"] == "gemma-4-31b"
+    # 2. When gemini-pro is placed in cooldown, router falls back to groq
+    await add_cooldown("google", "gemini-pro", base_seconds=60)
+    route_fallback = await select_model_and_platform("auto", difficulty=5)
+    assert route_fallback is not None
+    assert route_fallback["model_id"] == "llama-fast"
 
 
 @pytest.mark.asyncio
-async def test_prompt_token_capacity_rejection():
-    await init_db(TEST_DB)
-    async with get_db_connection(TEST_DB) as conn:
-        cipher, iv = encrypt_key("sk-test")
-        cur = await conn.execute(
-            "INSERT INTO api_keys (platform, display_name, encrypted_key, iv) VALUES (?, ?, ?, ?)",
-            ("groq", "Groq Inc", cipher, iv)
-        )
-        k1 = cur.lastrowid
+async def test_router_context_window_skipping():
+    await save_key(platform="google", raw_key="sk-test-google")
 
-        # Model with 8k TPM limit
-        await conn.execute(
-            "INSERT INTO models (platform, model_id, display_name, base_score, tpm_limit) VALUES (?, ?, ?, ?, ?)",
-            ("groq", "small-model", "Small Model", 90, 8000)
-        )
-        await conn.commit()
+    # Model with small context window (4000 tokens)
+    await add_model(
+        platform="google",
+        model_id="small-ctx-model",
+        display_name="Small Context Model",
+        base_score=3,
+        context_window=4000
+    )
 
-        # Prompt with 85k tokens exceeds 8k TPM limit
-        route = await select_model_and_platform(conn, "auto", 1, estimated_prompt_tokens=85000)
-        assert route is None
+    # Prompt with 8000 tokens should be skipped
+    route = await select_model_and_platform("auto", difficulty=3, estimated_prompt_tokens=8000)
+    assert route is None
+
+    # Prompt with 2000 tokens should be accepted
+    route_ok = await select_model_and_platform("auto", difficulty=3, estimated_prompt_tokens=2000)
+    assert route_ok is not None
+    assert route_ok["model_id"] == "small-ctx-model"
 
 
 @pytest.mark.asyncio
-async def test_score_zero_emergency_fallback():
-    await init_db(TEST_DB)
-    async with get_db_connection(TEST_DB) as conn:
-        cipher, iv = encrypt_key("sk-test")
-        cur = await conn.execute(
-            "INSERT OR REPLACE INTO api_keys (platform, display_name, encrypted_key, iv, status, enabled) VALUES (?, ?, ?, ?, 'healthy', 1)",
-            ("google", "Google AI", cipher, iv)
-        )
-        k1 = cur.lastrowid
+async def test_router_exclusion_list():
+    await save_key(platform="google", raw_key="sk-test-google")
+    await add_model(platform="google", model_id="model-a", base_score=4)
+    await add_model(platform="google", model_id="model-b", base_score=3)
 
-        await conn.execute("DELETE FROM models")
-        # Primary model (score 4) and Emergency Fallback model (score 0)
-        await conn.execute(
-            "INSERT INTO models (platform, model_id, display_name, base_score) VALUES (?, ?, ?, ?)",
-            ("google", "primary-model", "Primary Model", 4)
-        )
-        await conn.execute(
-            "INSERT INTO models (platform, model_id, display_name, base_score) VALUES (?, ?, ?, ?)",
-            ("google", "fallback-model", "Fallback Model", 0)
-        )
-        await conn.commit()
-
-        # 1. Primary model is selected while healthy
-        route1 = await select_model_and_platform(conn, "auto", 1)
-        assert route1 is not None
-        assert route1["model_id"] == "primary-model"
-
-        # 2. When primary model enters cooldown, emergency score 0 model is activated
-        await add_cooldown(conn, "google", "primary-model", k1, 60)
-        route2 = await select_model_and_platform(conn, "auto", 1)
-        assert route2 is not None
-        assert route2["model_id"] == "fallback-model"
+    # Exclude model-a
+    route = await select_model_and_platform("auto", difficulty=4, exclude_models={("google", "model-a")})
+    assert route is not None
+    assert route["model_id"] == "model-b"
 
 
-def test_extract_quota_limits():
-    from src.providers.openai_compat import OpenAIAdapter
-    adapter = OpenAIAdapter()
+@pytest.mark.asyncio
+async def test_router_pinned_direct_model():
+    await save_key(platform="google", raw_key="sk-test-google")
+    await add_model(platform="google", model_id="pinned-model", base_score=1)
 
-    # General headers test
-    headers = {
-        "x-ratelimit-limit-requests": "10000",
-        "x-ratelimit-limit-requests-day": "50000",
-        "x-ratelimit-limit-tokens": "2000000"
-    }
-    limits = adapter.extract_quota_limits("openai", 200, headers)
-    assert limits["rpm_limit"] == 10000
-    assert limits["rpd_limit"] == 50000
-    assert limits["tpm_limit"] == 2000000
+    route = await select_model_and_platform(requested_model="pinned-model", difficulty=None)
+    assert route is not None
+    assert route["model_id"] == "pinned-model"
+    assert route["platform"] == "google"

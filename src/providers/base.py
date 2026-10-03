@@ -26,15 +26,18 @@ class BaseProvider(ABC):
         pass
 
     @abstractmethod
-    def format_stream_chunk(self, raw_chunk: bytes) -> bytes:
+    def format_stream_chunk(
+        self, raw_chunk: bytes, stream_state: Any = None
+    ) -> Tuple[bytes, Dict[str, Any]]:
         """
         Normalizes raw streaming SSE chunk bytes into OpenAI data: {...} SSE format.
+        Returns: (formatted_chunk_bytes, usage_info_dict)
         """
         pass
 
     def extract_quota_limits(self, platform: str, status_code: int, headers: Any = None, body_bytes: bytes = b"") -> Dict[str, Any]:
         """
         Optional hook for provider adapters to extract model quota ceilings (RPM, RPD, TPM, TPD)
-        from HTTP headers or response body bytes.
+        and quota exhaustion flags from HTTP headers or response body bytes.
         """
-        return {"rpm_limit": None, "rpd_limit": None, "tpm_limit": None, "tpd_limit": None}
+        return {"rpm_limit": None, "rpd_limit": None, "tpm_limit": None, "tpd_limit": None, "is_daily_exhausted": False}

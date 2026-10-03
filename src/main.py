@@ -1,28 +1,57 @@
 import time
 import os
 import json
+import uuid
+import asyncio
 from typing import Dict, Any, List, Optional
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, FileResponse
+from fastapi.responses import JSONResponse, FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
-from src.config import PORT, logger
+from src.config import PORT, logger, recent_terminal_logs, log_subscribers, web_terminal_handler
 from src.models import ChatCompletionRequest
-from src.db import init_db, get_db_connection, log_admin_audit, get_setting, set_setting
-from src.key_vault import encrypt_key
+from src.db import (
+    init_db,
+    get_db_connection,
+    get_setting,
+    set_setting,
+    log_admin_audit,
+    get_admin_models,
+    add_model,
+    update_model,
+    toggle_model,
+    delete_model,
+    get_admin_keys,
+    save_key,
+    toggle_key,
+    delete_key,
+    get_model_usage,
+    clear_cooldown,
+    get_admin_analytics,
+    get_recent_traces,
+    get_audit_logs,
+    log_request_trace,
+)
 from src.triage import grade_prompt_difficulty
 from src.proxy import execute_proxy_request
-from src.router.quota import get_model_usage
+import logging
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Ensure uvicorn logs are forwarded to web terminal
+    for uvi_name in ("uvicorn", "uvicorn.access", "uvicorn.error"):
+        uvi_logger = logging.getLogger(uvi_name)
+        if web_terminal_handler not in uvi_logger.handlers:
+            uvi_logger.addHandler(web_terminal_handler)
+
     logger.info(f"[SERVER INIT] Bootstrapping LLMProxy on port {PORT}...")
     await init_db()
     logger.info("[SERVER READY] Gateway is online and ready to accept requests.")
     yield
     logger.info("[SERVER SHUTDOWN] Gateway shutting down cleanly.")
+
 
 
 app = FastAPI(
@@ -46,7 +75,6 @@ async def serve_admin_dashboard():
     return JSONResponse(content={"status": "Gateway online", "dashboard": "static/index.html not found"})
 
 
-
 @app.post("/v1/chat/completions")
 async def proxy_endpoint(payload: ChatCompletionRequest):
     """
@@ -55,13 +83,24 @@ async def proxy_endpoint(payload: ChatCompletionRequest):
     """
     if payload.model == "triage":
         logger.info("[MAIN ROUTE] Direct virtual triage route requested.")
-        async with get_db_connection() as conn:
-            difficulty = await grade_prompt_difficulty(conn, payload.messages)
-
+        req_id = f"req-triage-{uuid.uuid4().hex[:12]}"
+        difficulty = await grade_prompt_difficulty(payload.messages)
         triage_content = {
             "difficulty": difficulty,
             "system_prompt_reference": "1=casual, 2=editing, 3=multi-step, 4=reasoning/summarization, 5=complex-system-design"
         }
+        await log_request_trace(
+            request_id=req_id,
+            triage_difficulty=difficulty,
+            has_tools=bool(payload.tools),
+            final_platform="internal",
+            final_model_id="triage",
+            final_status=200,
+            finish_reason="stop",
+            tokens_output=len(str(triage_content)) // 4,
+            response_preview=str(triage_content)[:200],
+            attempts_detail=json.dumps([{"attempt": 1, "route": "internal/triage", "status": 200}])
+        )
         return JSONResponse(content={
             "id": f"chatcmpl-triage-{int(time.time())}",
             "object": "chat.completion",
@@ -81,9 +120,7 @@ async def proxy_endpoint(payload: ChatCompletionRequest):
 
     elif payload.model == "auto":
         logger.info("[MAIN ROUTE] Dynamic BwK auto route requested. Grading prompt difficulty...")
-        async with get_db_connection() as conn:
-            difficulty = await grade_prompt_difficulty(conn, payload.messages)
-        
+        difficulty = await grade_prompt_difficulty(payload.messages)
         logger.info(f"[MAIN ROUTE] Prompt difficulty graded as Difficulty={difficulty}. Delegating to failover proxy...")
         return await execute_proxy_request(payload, difficulty=difficulty)
 
@@ -94,9 +131,7 @@ async def proxy_endpoint(payload: ChatCompletionRequest):
 
 @app.get("/v1/models")
 async def get_models():
-    """
-    Exposes only the virtual 'auto' model in the public model catalog list.
-    """
+    """Exposes only the virtual 'auto' model in the public model catalog list."""
     return {
         "object": "list",
         "data": [
@@ -113,120 +148,99 @@ async def get_models():
     }
 
 
-
 @app.get("/api/admin/stats")
 async def get_admin_stats():
     """Returns gateway aggregate usage, TTFT, and capacity pool metrics."""
     async with get_db_connection() as conn:
-        cur = await conn.execute("SELECT COUNT(*), COALESCE(SUM(tokens_input + tokens_output), 0), COALESCE(AVG(ttft_ms), 0) FROM usage_log")
+        cur = await conn.execute(
+            "SELECT COUNT(*), COALESCE(SUM(tokens_input + tokens_output), 0), COALESCE(AVG(ttft_ms), 0) FROM usage_log"
+        )
         row = await cur.fetchone()
         total_requests, total_tokens, avg_ttft_ms = row[0] or 0, row[1] or 0, round(row[2] or 0, 1)
 
         cur_cd = await conn.execute("SELECT COUNT(DISTINCT model_id) FROM rate_limit_cooldowns WHERE expires_at > datetime('now')")
         active_cooldowns = (await cur_cd.fetchone())[0] or 0
 
-        cur_models = await conn.execute(
-            """
-            SELECT m.platform, m.model_id, m.shared_quota_group, m.rpm_limit, m.rpd_limit, m.tpm_limit, m.tpd_limit, m.enabled
-            FROM models m JOIN api_keys a ON m.platform = a.platform
-            WHERE m.enabled = 1 AND a.enabled = 1 AND a.status != 'error'
-            """
-        )
-        model_rows = await cur_models.fetchall()
-
-        total_capacity_rpm = 0
-        current_used_rpm = 0
-        total_capacity_rpd = 0
-        current_used_rpd = 0
-
-        total_capacity_tpm = 0
-        current_used_tpm = 0
-        total_capacity_tpd = 0
-        current_used_tpd = 0
-        healthy_models = 0
-
         cur_cd_set = await conn.execute("SELECT DISTINCT model_id FROM rate_limit_cooldowns WHERE expires_at > datetime('now')")
         cooldown_set = set(r[0] for r in await cur_cd_set.fetchall())
 
-        seen_groups = set()
-        for p, m_id, group, rpm_limit, rpd_limit, tpm_limit, tpd_limit, enabled in model_rows:
-            if m_id not in cooldown_set:
-                healthy_models += 1
+    all_models = await get_admin_models()
 
-            group_key = group or f"{p}:{m_id}"
-            if group_key not in seen_groups:
-                seen_groups.add(group_key)
-                rpm, rpd, tpm, tpd = await get_model_usage(conn, m_id, group)
-                if rpm_limit:
-                    total_capacity_rpm += rpm_limit
-                    current_used_rpm += rpm
-                if rpd_limit:
-                    total_capacity_rpd += rpd_limit
-                    current_used_rpd += rpd
-                if tpm_limit:
-                    total_capacity_tpm += tpm_limit
-                    current_used_tpm += tpm
-                if tpd_limit:
-                    total_capacity_tpd += tpd_limit
-                    current_used_tpd += tpd
+    total_capacity_rpm = 0
+    current_used_rpm = 0
+    total_capacity_rpd = 0
+    current_used_rpd = 0
+    total_capacity_tpm = 0
+    current_used_tpm = 0
+    total_capacity_tpd = 0
+    current_used_tpd = 0
+    healthy_models = 0
 
-        return {
-            "total_requests": total_requests,
-            "total_tokens": total_tokens,
-            "avg_ttft_ms": avg_ttft_ms,
-            "active_cooldowns": active_cooldowns,
-            "healthy_models": healthy_models,
-            "total_capacity_rpm": total_capacity_rpm,
-            "current_used_rpm": current_used_rpm,
-            "total_capacity_rpd": total_capacity_rpd,
-            "current_used_rpd": current_used_rpd,
-            "total_capacity_tpm": total_capacity_tpm,
-            "current_used_tpm": current_used_tpm,
-            "total_capacity_tpd": total_capacity_tpd,
-            "current_used_tpd": current_used_tpd
-        }
+    seen_groups = set()
+    for m in all_models:
+        if not m["enabled"]:
+            continue
+        if m["model_id"] not in cooldown_set:
+            healthy_models += 1
+
+        group_key = m["shared_quota_group"] or f"{m['platform']}:{m['model_id']}"
+        if group_key not in seen_groups:
+            seen_groups.add(group_key)
+            rpm, rpd, tpm, tpd = await get_model_usage(m["model_id"], m["shared_quota_group"])
+            if m["rpm_limit"]:
+                total_capacity_rpm += m["rpm_limit"]
+                current_used_rpm += rpm
+            if m["rpd_limit"]:
+                total_capacity_rpd += m["rpd_limit"]
+                current_used_rpd += rpd
+            if m["tpm_limit"]:
+                total_capacity_tpm += m["tpm_limit"]
+                current_used_tpm += tpm
+            if m["tpd_limit"]:
+                total_capacity_tpd += m["tpd_limit"]
+                current_used_tpd += tpd
+
+    return {
+        "total_requests": total_requests,
+        "total_tokens": total_tokens,
+        "avg_ttft_ms": avg_ttft_ms,
+        "active_cooldowns": active_cooldowns,
+        "healthy_models": healthy_models,
+        "total_capacity_rpm": total_capacity_rpm,
+        "current_used_rpm": current_used_rpm,
+        "total_capacity_rpd": total_capacity_rpd,
+        "current_used_rpd": current_used_rpd,
+        "total_capacity_tpm": total_capacity_tpm,
+        "current_used_tpm": current_used_tpm,
+        "total_capacity_tpd": total_capacity_tpd,
+        "current_used_tpd": current_used_tpd
+    }
 
 
 @app.get("/api/admin/models")
-async def get_admin_models():
-    """Returns full catalog model details including RPM, RPD, TPM, and TPD quotas."""
+async def get_admin_models_endpoint():
+    """Returns full catalog model details including live RPM, RPD, TPM, and TPD usages and cooldown expiry."""
     async with get_db_connection() as conn:
-        cur = await conn.execute(
-            """
-            SELECT m.platform, m.model_id, m.display_name, m.shared_quota_group,
-                   m.rpm_limit, m.rpd_limit, m.tpm_limit, m.tpd_limit,
-                   m.base_score, m.enabled
-            FROM models m
-            ORDER BY m.platform, m.base_score DESC
-            """
+        cur_cd = await conn.execute(
+            "SELECT platform, model_id, expires_at FROM rate_limit_cooldowns WHERE expires_at > datetime('now')"
         )
-        rows = await cur.fetchall()
+        cooldown_map = {(r[0], r[1]): r[2] for r in await cur_cd.fetchall()}
 
-        cur_cd = await conn.execute("SELECT DISTINCT model_id FROM rate_limit_cooldowns WHERE expires_at > datetime('now')")
-        cooldown_models = set(r[0] for r in await cur_cd.fetchall())
-
-        result = []
-        for r in rows:
-            platform, model_id, display_name, shared_group, rpm_limit, rpd_limit, tpm_limit, tpd_limit, base_score, enabled = r
-            rpm, rpd, tpm, tpd = await get_model_usage(conn, model_id, shared_group)
-            result.append({
-                "platform": platform,
-                "model_id": model_id,
-                "display_name": display_name,
-                "shared_quota_group": shared_group,
-                "rpm_limit": rpm_limit,
-                "rpd_limit": rpd_limit,
-                "tpm_limit": tpm_limit,
-                "tpd_limit": tpd_limit,
-                "base_score": base_score,
-                "enabled": enabled == 1,
-                "current_rpm": rpm,
-                "current_rpd": rpd,
-                "current_tpm": tpm,
-                "current_tpd": tpd,
-                "is_cooldown": model_id in cooldown_models
-            })
-        return result
+    models = await get_admin_models()
+    result = []
+    for m in models:
+        rpm, rpd, tpm, tpd = await get_model_usage(m["model_id"], m["shared_quota_group"])
+        cd_expiry = cooldown_map.get((m["platform"], m["model_id"]))
+        result.append({
+            **m,
+            "current_rpm": rpm,
+            "current_rpd": rpd,
+            "current_tpm": tpm,
+            "current_tpd": tpd,
+            "is_cooldown": cd_expiry is not None,
+            "cooldown_until": cd_expiry
+        })
+    return result
 
 
 @app.post("/api/admin/models/add")
@@ -234,50 +248,31 @@ async def add_admin_model(payload: Dict[str, Any]):
     """Registers a new model in the catalog and logs audit trail."""
     platform = payload.get("platform")
     model_id = payload.get("model_id")
+    if not platform or not model_id:
+        return JSONResponse(status_code=400, content={"error": "platform and model_id are required"})
+
     display_name = payload.get("display_name") or model_id
-    shared_group = payload.get("shared_quota_group") or None
     rpm_limit = payload.get("rpm_limit")
     rpd_limit = payload.get("rpd_limit")
     tpm_limit = payload.get("tpm_limit")
     tpd_limit = payload.get("tpd_limit")
+    context_window = payload.get("context_window")
     base_score = payload.get("base_score", 3)
+    shared_group = payload.get("shared_quota_group") or None
 
-    if not platform or not model_id:
-        return JSONResponse(status_code=400, content={"error": "platform and model_id are required"})
-
-    async with get_db_connection() as conn:
-        await conn.execute(
-            """
-            INSERT INTO models (platform, model_id, display_name, shared_quota_group, rpm_limit, rpd_limit, tpm_limit, tpd_limit, base_score, enabled)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
-            ON CONFLICT(platform, model_id) DO UPDATE SET
-                display_name = excluded.display_name,
-                shared_quota_group = excluded.shared_quota_group,
-                rpm_limit = excluded.rpm_limit,
-                rpd_limit = excluded.rpd_limit,
-                tpm_limit = excluded.tpm_limit,
-                tpd_limit = excluded.tpd_limit,
-                base_score = excluded.base_score,
-                enabled = 1
-            """,
-            (platform, model_id, display_name, shared_group, rpm_limit, rpd_limit, tpm_limit, tpd_limit, base_score)
-        )
-
-        cur_keys = await conn.execute("SELECT id FROM api_keys WHERE platform = ?", (platform,))
-        key_rows = await cur_keys.fetchall()
-        for k in key_rows:
-            await conn.execute(
-                """
-                INSERT INTO key_capabilities (key_id, model_id, is_capable)
-                VALUES (?, ?, 1)
-                ON CONFLICT(key_id, model_id) DO UPDATE SET is_capable = 1
-                """,
-                (k[0], model_id)
-            )
-
-        await log_admin_audit(conn, "ADD_MODEL", "model", f"{platform}/{model_id}", f"Name: {display_name}, Score: {base_score}, RPM: {rpm_limit}, TPM: {tpm_limit}")
-        await conn.commit()
-
+    await add_model(
+        platform=platform,
+        model_id=model_id,
+        display_name=display_name,
+        shared_quota_group=shared_group,
+        rpm_limit=rpm_limit,
+        rpd_limit=rpd_limit,
+        tpm_limit=tpm_limit,
+        tpd_limit=tpd_limit,
+        context_window=context_window,
+        base_score=base_score
+    )
+    await log_admin_audit("ADD_MODEL", "model", f"{platform}/{model_id}", f"Score: {base_score}, Limits: RPM={rpm_limit}, TPM={tpm_limit}")
     return {"status": "ok", "message": f"Added model {platform}/{model_id}"}
 
 
@@ -286,201 +281,120 @@ async def toggle_admin_model(payload: Dict[str, Any]):
     """Toggles model enabled state and logs audit trail."""
     platform = payload.get("platform")
     model_id = payload.get("model_id")
-    enabled = 1 if payload.get("enabled") else 0
+    enabled = bool(payload.get("enabled"))
 
-    async with get_db_connection() as conn:
-        await conn.execute("UPDATE models SET enabled = ? WHERE platform = ? AND model_id = ?", (enabled, platform, model_id))
-        await log_admin_audit(conn, "TOGGLE_MODEL", "model", f"{platform}/{model_id}", f"Enabled: {enabled == 1}")
-        await conn.commit()
+    try:
+        success = await toggle_model(platform, model_id, enabled)
+        if not success:
+            return JSONResponse(status_code=404, content={"error": f"Model {platform}/{model_id} not found."})
+    except ValueError as e:
+        return JSONResponse(status_code=400, content={"error": str(e)})
+
+    await log_admin_audit("TOGGLE_MODEL", "model", f"{platform}/{model_id}", f"Enabled: {enabled}")
     return {"status": "ok", "enabled": enabled}
 
 
 @app.post("/api/admin/models/update")
-async def update_admin_model(payload: Dict[str, Any]):
-    """Updates model parameters (including platform and model_id) and logs audit trail."""
+async def update_admin_model_endpoint(payload: Dict[str, Any]):
+    """Updates model parameters and logs audit trail."""
     platform = payload.get("platform")
     model_id = payload.get("model_id")
     old_platform = payload.get("old_platform") or platform
     old_model_id = payload.get("old_model_id") or model_id
-    display_name = payload.get("display_name")
-    shared_group = payload.get("shared_quota_group") or None
-    rpm_limit = payload.get("rpm_limit")
-    rpd_limit = payload.get("rpd_limit")
-    tpm_limit = payload.get("tpm_limit")
-    tpd_limit = payload.get("tpd_limit")
-    base_score = payload.get("base_score", 3)
 
-    async with get_db_connection() as conn:
-        if (old_platform, old_model_id) != (platform, model_id):
-            await conn.execute(
-                "UPDATE key_capabilities SET model_id = ? WHERE model_id = ?",
-                (model_id, old_model_id)
-            )
-            await conn.execute(
-                "UPDATE usage_log SET platform = ?, model_id = ? WHERE platform = ? AND model_id = ?",
-                (platform, model_id, old_platform, old_model_id)
-            )
-            await conn.execute(
-                "UPDATE rate_limit_cooldowns SET platform = ?, model_id = ? WHERE platform = ? AND model_id = ?",
-                (platform, model_id, old_platform, old_model_id)
-            )
-
-        await conn.execute(
-            """
-            UPDATE models 
-            SET platform = ?,
-                model_id = ?,
-                display_name = COALESCE(?, display_name),
-                shared_quota_group = ?,
-                rpm_limit = ?,
-                rpd_limit = ?,
-                tpm_limit = ?,
-                tpd_limit = ?,
-                base_score = ?
-            WHERE platform = ? AND model_id = ?
-            """,
-            (platform, model_id, display_name, shared_group, rpm_limit, rpd_limit, tpm_limit, tpd_limit, base_score, old_platform, old_model_id)
-        )
-        await log_admin_audit(conn, "UPDATE_MODEL", "model", f"{platform}/{model_id}", f"Renamed from {old_platform}/{old_model_id}, Name: {display_name}, Score: {base_score}")
-        await conn.commit()
+    await update_model(
+        old_platform=old_platform,
+        old_model_id=old_model_id,
+        platform=platform,
+        model_id=model_id,
+        display_name=payload.get("display_name"),
+        shared_quota_group=payload.get("shared_quota_group") or None,
+        rpm_limit=payload.get("rpm_limit"),
+        rpd_limit=payload.get("rpd_limit"),
+        tpm_limit=payload.get("tpm_limit"),
+        tpd_limit=payload.get("tpd_limit"),
+        base_score=payload.get("base_score", 3)
+    )
+    await log_admin_audit("UPDATE_MODEL", "model", f"{platform}/{model_id}", f"Updated from {old_platform}/{old_model_id}")
     return {"status": "ok", "message": f"Updated model {platform}/{model_id}"}
 
 
 @app.post("/api/admin/models/delete")
-async def delete_admin_model(payload: Dict[str, Any]):
+async def delete_admin_model_endpoint(payload: Dict[str, Any]):
     """Deletes a model from catalog and logs audit trail."""
     platform = payload.get("platform")
     model_id = payload.get("model_id")
-
-    async with get_db_connection() as conn:
-        await conn.execute("DELETE FROM models WHERE platform = ? AND model_id = ?", (platform, model_id))
-        await conn.execute("DELETE FROM key_capabilities WHERE model_id = ?", (model_id,))
-        await log_admin_audit(conn, "DELETE_MODEL", "model", f"{platform}/{model_id}", "Deleted from catalog")
-        await conn.commit()
+    await delete_model(platform, model_id)
+    await log_admin_audit("DELETE_MODEL", "model", f"{platform}/{model_id}", "Deleted from catalog")
     return {"status": "ok", "message": f"Deleted model {platform}/{model_id}"}
 
 
+@app.post("/api/admin/models/clear-cooldown")
+async def clear_model_cooldown_endpoint(payload: Dict[str, Any]):
+    """Clears active rate-limit or daily cooldown for a model."""
+    platform = payload.get("platform")
+    model_id = payload.get("model_id")
+    shared_quota_group = payload.get("shared_quota_group")
+    if not platform or not model_id:
+        return JSONResponse(status_code=400, content={"error": "platform and model_id are required"})
+
+    await clear_cooldown(platform, model_id, shared_quota_group)
+    await log_admin_audit("CLEAR_COOLDOWN", "model", f"{platform}/{model_id}", "Cleared cooldown quarantine")
+    return {"status": "ok", "message": f"Cleared cooldown for {platform}/{model_id}"}
+
+
 @app.get("/api/admin/keys")
-async def get_admin_keys():
+async def get_admin_keys_endpoint():
     """Returns registered API keys status list."""
-    async with get_db_connection() as conn:
-        cur = await conn.execute("SELECT platform, display_name, api_url, status, enabled, last_used_at FROM api_keys ORDER BY id ASC")
-        rows = await cur.fetchall()
-        return [
-            {
-                "platform": r[0],
-                "display_name": r[1],
-                "api_url": r[2],
-                "status": r[3],
-                "enabled": r[4] == 1,
-                "last_used_at": r[5]
-            }
-            for r in rows
-        ]
+    return await get_admin_keys()
 
 
 @app.post("/api/admin/keys/toggle")
 async def toggle_admin_key(payload: Dict[str, Any]):
     """Toggles API key enabled state and logs audit trail."""
     platform = payload.get("platform")
-    enabled = 1 if payload.get("enabled") else 0
-
-    async with get_db_connection() as conn:
-        await conn.execute("UPDATE api_keys SET enabled = ? WHERE platform = ?", (enabled, platform))
-        await log_admin_audit(conn, "TOGGLE_KEY", "key", platform, f"Enabled: {enabled == 1}")
-        await conn.commit()
+    enabled = bool(payload.get("enabled"))
+    await toggle_key(platform, enabled)
+    await log_admin_audit("TOGGLE_KEY", "key", platform, f"Enabled: {enabled}")
     return {"status": "ok", "enabled": enabled}
 
 
 @app.post("/api/admin/keys/add")
 async def add_admin_key(payload: Dict[str, Any]):
-    """Encrypts and registers a new or updated API key and logs audit trail."""
+    """Encrypts and registers or updates an API key in vault and logs audit trail."""
     platform = payload.get("platform")
+    if not platform:
+        return JSONResponse(status_code=400, content={"error": "platform is required"})
+
     display_name = payload.get("display_name")
     api_url = payload.get("api_url")
     raw_key = payload.get("api_key")
 
-    if not platform:
-        return JSONResponse(status_code=400, content={"error": "platform is required"})
-
-    async with get_db_connection() as conn:
-        if raw_key:
-            cipher, iv = encrypt_key(raw_key)
-            await conn.execute(
-                """
-                INSERT INTO api_keys (platform, display_name, api_url, encrypted_key, iv, status, enabled)
-                VALUES (?, ?, ?, ?, ?, 'healthy', 1)
-                ON CONFLICT(platform) DO UPDATE SET
-                    display_name = excluded.display_name,
-                    api_url = excluded.api_url,
-                    encrypted_key = excluded.encrypted_key,
-                    iv = excluded.iv,
-                    status = 'healthy',
-                    enabled = 1
-                """,
-                (platform, display_name, api_url, cipher, iv)
-            )
-        else:
-            await conn.execute(
-                """
-                UPDATE api_keys
-                SET display_name = COALESCE(?, display_name),
-                    api_url = COALESCE(?, api_url)
-                WHERE platform = ?
-                """,
-                (display_name, api_url, platform)
-            )
-
-        cur_key = await conn.execute("SELECT id FROM api_keys WHERE platform = ?", (platform,))
-        row = await cur_key.fetchone()
-        if row:
-            key_id = row[0]
-            cur_models = await conn.execute("SELECT model_id FROM models WHERE platform = ?", (platform,))
-            m_rows = await cur_models.fetchall()
-            for (m_id,) in m_rows:
-                await conn.execute(
-                    """
-                    INSERT INTO key_capabilities (key_id, model_id, is_capable)
-                    VALUES (?, ?, 1)
-                    ON CONFLICT(key_id, model_id) DO UPDATE SET is_capable = 1
-                    """,
-                    (key_id, m_id)
-                )
-
-        await log_admin_audit(conn, "SAVE_KEY", "key", platform, f"Display: {display_name}, URL: {api_url}")
-        await conn.commit()
-
+    await save_key(platform=platform, raw_key=raw_key, display_name=display_name, api_url=api_url)
+    await log_admin_audit("SAVE_KEY", "key", platform, f"Display: {display_name}, URL: {api_url}")
     return {"status": "ok", "message": f"Key for platform '{platform}' saved."}
 
 
 @app.post("/api/admin/keys/delete")
-async def delete_admin_key(payload: Dict[str, Any]):
-    """Deletes an API key platform and logs audit trail."""
+async def delete_admin_key_endpoint(payload: Dict[str, Any]):
+    """Safely deletes an API key platform and disables associated models."""
     platform = payload.get("platform")
-
-    async with get_db_connection() as conn:
-        cur_key = await conn.execute("SELECT id FROM api_keys WHERE platform = ?", (platform,))
-        row = await cur_key.fetchone()
-        if row:
-            await conn.execute("DELETE FROM key_capabilities WHERE key_id = ?", (row[0],))
-        await conn.execute("DELETE FROM api_keys WHERE platform = ?", (platform,))
-        await log_admin_audit(conn, "DELETE_KEY", "key", platform, "Deleted provider key")
-        await conn.commit()
+    await delete_key(platform)
+    await log_admin_audit("DELETE_KEY", "key", platform, "Deleted provider key and disabled platform models")
     return {"status": "ok", "message": f"Deleted API key for platform '{platform}'"}
 
 
 @app.get("/api/admin/triage")
 async def get_admin_triage_settings():
     """Returns current triage classification strategy and model settings."""
-    async with get_db_connection() as conn:
-        strategy = await get_setting(conn, "triage_strategy", default="llm")
-        platform = await get_setting(conn, "triage_platform", default="google")
-        model = await get_setting(conn, "triage_model", default="gemini-3.1-flash-lite")
-        return {
-            "triage_strategy": strategy,
-            "triage_platform": platform,
-            "triage_model": model
-        }
+    strategy = await get_setting("triage_strategy", default="llm")
+    platform = await get_setting("triage_platform", default="google")
+    model = await get_setting("triage_model", default="gemini-3.5-flash-lite")
+    return {
+        "triage_strategy": strategy,
+        "triage_platform": platform,
+        "triage_model": model
+    }
 
 
 @app.post("/api/admin/triage/save")
@@ -488,107 +402,70 @@ async def save_admin_triage_settings(payload: Dict[str, Any]):
     """Updates triage classification strategy and model settings."""
     strategy = payload.get("triage_strategy", "llm")
     platform = payload.get("triage_platform", "google")
-    model = payload.get("triage_model", "gemini-3.1-flash-lite")
+    model = payload.get("triage_model", "gemini-3.5-flash-lite")
 
-    async with get_db_connection() as conn:
-        await set_setting(conn, "triage_strategy", strategy)
-        await set_setting(conn, "triage_platform", platform)
-        await set_setting(conn, "triage_model", model)
-        await log_admin_audit(conn, "SAVE_TRIAGE_SETTINGS", "setting", f"{platform}/{model}", f"Strategy: {strategy}, Model: {platform}/{model}")
-        await conn.commit()
-
+    await set_setting("triage_strategy", strategy)
+    await set_setting("triage_platform", platform)
+    await set_setting("triage_model", model)
+    await log_admin_audit("SAVE_TRIAGE_SETTINGS", "setting", f"{platform}/{model}", f"Strategy: {strategy}, Model: {platform}/{model}")
     return {"status": "ok", "message": "Triage settings updated successfully"}
 
 
 @app.get("/api/admin/analytics")
-async def get_admin_analytics(timeframe: str = "7d"):
+async def get_admin_analytics_endpoint(timeframe: str = "7d"):
     """Returns aggregated usage, token breakdown, performance latency, and per-model stats."""
-    time_filter_sql = ""
-    if timeframe == "today":
-        time_filter_sql = "WHERE timestamp >= datetime('now', 'start of day')"
-    elif timeframe == "7d":
-        time_filter_sql = "WHERE timestamp >= datetime('now', '-7 days')"
-    elif timeframe == "30d":
-        time_filter_sql = "WHERE timestamp >= datetime('now', '-30 days')"
-
-    async with get_db_connection() as conn:
-        summary_query = f"""
-            SELECT 
-                COUNT(*) AS total_requests,
-                SUM(CASE WHEN request_success = 1 THEN 1 ELSE 0 END) AS successful_requests,
-                SUM(CASE WHEN request_success = 0 THEN 1 ELSE 0 END) AS failed_requests,
-                COALESCE(SUM(tokens_input), 0) AS total_input_tokens,
-                COALESCE(SUM(tokens_output), 0) AS total_output_tokens,
-                COALESCE(AVG(duration_ms), 0) AS avg_latency_ms,
-                COALESCE(AVG(ttft_ms), 0) AS avg_ttft_ms
-            FROM usage_log
-            {time_filter_sql}
-        """
-        cur = await conn.execute(summary_query)
-        summary_row = await cur.fetchone()
-
-        total_reqs = summary_row[0] or 0
-        success_reqs = summary_row[1] or 0
-        failed_reqs = summary_row[2] or 0
-        in_tokens = summary_row[3] or 0
-        out_tokens = summary_row[4] or 0
-        avg_latency = round(summary_row[5] or 0)
-        avg_ttft = round(summary_row[6] or 0)
-        success_rate = round((success_reqs / total_reqs * 100), 1) if total_reqs > 0 else 100.0
-
-        model_query = f"""
-            SELECT 
-                platform,
-                model_id,
-                COUNT(*) AS request_count,
-                SUM(CASE WHEN request_success = 1 THEN 1 ELSE 0 END) AS success_count,
-                COALESCE(SUM(tokens_input + tokens_output), 0) AS total_tokens,
-                COALESCE(AVG(duration_ms), 0) AS avg_latency_ms
-            FROM usage_log
-            {time_filter_sql}
-            GROUP BY platform, model_id
-            ORDER BY total_tokens DESC, request_count DESC
-        """
-        cur_m = await conn.execute(model_query)
-        m_rows = await cur_m.fetchall()
-
-        models_breakdown = []
-        for r in m_rows:
-            m_reqs = r[2] or 0
-            m_success = r[3] or 0
-            m_rate = round((m_success / m_reqs * 100), 1) if m_reqs > 0 else 100.0
-            models_breakdown.append({
-                "platform": r[0],
-                "model_id": r[1],
-                "request_count": m_reqs,
-                "total_tokens": r[4] or 0,
-                "avg_latency_ms": round(r[5] or 0),
-                "success_rate": m_rate
-            })
-
-        return {
-            "timeframe": timeframe,
-            "total_requests": total_reqs,
-            "successful_requests": success_reqs,
-            "failed_requests": failed_reqs,
-            "success_rate": success_rate,
-            "total_input_tokens": in_tokens,
-            "total_output_tokens": out_tokens,
-            "total_tokens": in_tokens + out_tokens,
-            "avg_latency_ms": avg_latency,
-            "avg_ttft_ms": avg_ttft,
-            "models_breakdown": models_breakdown
-        }
+    return await get_admin_analytics(timeframe)
 
 
 @app.get("/api/debug/trace")
 async def get_latest_debug_trace():
-    """Returns the JSON trace of the last proxy request for debugging payload transformations."""
-    scratch_trace = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scratch", "latest_debug_trace.json")
-    if os.path.exists(scratch_trace):
-        try:
-            with open(scratch_trace, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception as e:
-            return JSONResponse(status_code=500, content={"error": f"Failed to read trace file: {e}"})
+    """Returns the most recent multi-step request trace from database."""
+    traces = await get_recent_traces(limit=1)
+    if traces:
+        return traces[0]
     return JSONResponse(status_code=404, content={"message": "No debug trace available yet. Send a request to generate a trace."})
+
+
+@app.get("/api/admin/traces")
+async def get_admin_traces_endpoint(limit: int = 20):
+    """Returns recent request traces with triage difficulty, failover attempts, and token counts."""
+    return await get_recent_traces(limit=limit)
+
+
+@app.get("/api/admin/audit")
+async def get_admin_audit_endpoint(limit: int = 20):
+    """Returns recent administrative audit actions."""
+    return await get_audit_logs(limit=limit)
+
+
+@app.get("/api/admin/logs/stream")
+async def stream_terminal_logs():
+    """Streams live server terminal logs via SSE to web dashboard."""
+    async def log_generator():
+        # 1. Send recent log backlog
+        backlog = list(recent_terminal_logs)
+        for line in backlog:
+            yield f"data: {json.dumps({'line': line})}\n\n"
+
+        # 2. Subscribe to live stream
+        queue: asyncio.Queue = asyncio.Queue()
+        log_subscribers.add(queue)
+        try:
+            while True:
+                msg = await queue.get()
+                yield f"data: {json.dumps({'line': msg})}\n\n"
+        except asyncio.CancelledError:
+            pass
+        finally:
+            log_subscribers.discard(queue)
+
+    return StreamingResponse(
+        log_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no"
+        }
+    )
+

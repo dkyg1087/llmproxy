@@ -588,3 +588,114 @@ option,
     transform: translateY(0);
   }
 }
+
+/* Quota Display Columns */
+.quota-cell {
+  min-width: 175px;
+}
+.quota-line {
+  margin-bottom: 6px;
+}
+.quota-line:last-child {
+  margin-bottom: 0;
+}
+.quota-header-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  font-size: 12px;
+  margin-bottom: 3px;
+}
+.quota-header-row .label {
+  font-weight: 600;
+  color: #fff;
+}
+.quota-header-row .limit {
+  font-size: 11px;
+  color: var(--text-muted);
+}
+.quota-header-row .percent {
+  font-size: 11px;
+  font-weight: 500;
+}
+
+/* Sub-Navigation Tabs */
+.subnav-tabs {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 16px;
+}
+.subnav-tab {
+  background: var(--bg-surface);
+  border: 1px solid var(--border-color);
+  color: var(--text-muted);
+  padding: 6px 14px;
+  border-radius: var(--radius);
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+.subnav-tab:hover {
+  background: var(--bg-surface-hover);
+  color: var(--text-main);
+}
+.subnav-tab.active {
+  background: var(--accent-blue);
+  border-color: var(--accent-blue);
+  color: #fff;
+}
+
+/* Trace Elements */
+.trace-attempt-card {
+  background: var(--bg-body);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius);
+  padding: 12px;
+  margin-bottom: 8px;
+}
+.trace-attempt-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 13px;
+  font-weight: 600;
+  margin-bottom: 4px;
+}
+.code-preview {
+  background: #090d16;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  padding: 12px;
+  font-family: monospace;
+  font-size: 12px;
+  color: #cbd5e1;
+  max-height: 250px;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+/* Terminal Live Stream Console */
+.terminal-console {
+  background: #080c14;
+  color: #d1d5db;
+  font-family: 'Consolas', 'Fira Code', 'Monaco', monospace;
+  font-size: 12px;
+  line-height: 1.6;
+  padding: 16px 20px;
+  height: 480px;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+  border-bottom-left-radius: var(--radius);
+  border-bottom-right-radius: var(--radius);
+}
+
+.terminal-console .log-info { color: #38bdf8; }
+.terminal-console .log-warn { color: #fbbf24; }
+.terminal-console .log-error { color: #f87171; }
+.terminal-console .log-debug { color: #94a3b8; }
+.terminal-console .log-timestamp { color: #64748b; margin-right: 6px; }
+
+
